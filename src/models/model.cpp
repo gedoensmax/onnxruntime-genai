@@ -8,6 +8,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <codecvt>
 
 #include "../generators.h"
 #include "../search.h"
@@ -826,8 +827,10 @@ void Model::CreateSessionOptionsFromConfig(const Config::SessionOptions& config_
   }
 
   if (config_session_options.ep_context_enable.has_value()) {
-    if (config_session_options.ep_context_enable.value())
+    if (config_session_options.ep_context_enable.value()) {
       session_options.SetEpContextEnable();
+      model_ctx_filename_ = "model_ctx.onnx";
+    }
   }
 
   if (config_session_options.ep_context_embed_mode.has_value()) {
@@ -836,6 +839,8 @@ void Model::CreateSessionOptionsFromConfig(const Config::SessionOptions& config_
 
   if (config_session_options.ep_context_file_path.has_value()) {
     session_options.SetEpContextFilePath(config_session_options.ep_context_file_path.value().c_str());
+    // TODO this will fail if a full path is given and not just a filename
+    model_ctx_filename_ = config_session_options.ep_context_file_path.value();
   }
 
   if (config_session_options.provider_options.empty() && config_session_options.use_env_allocators) {
@@ -918,9 +923,20 @@ std::unique_ptr<OrtSession> Model::CreateSession(OrtEnv& ort_env, const std::str
 
     return session;
   }
-
-  // Otherwise, load the model from the file system
-  return OrtSession::Create(ort_env, (config_->config_path / fs::path(model_filename)).c_str(), session_options);
+  {
+    DirGuard dir_guard;
+    if (!model_ctx_filename_.empty()) {
+      // same hack as required above since the reference to an external ep context is relative to the workdir
+      dir_guard.ChangeTo(config_->config_path);
+    }
+    // Otherwise, load the model from the file system
+    auto model_ctx_path = config_->config_path / fs::path(model_ctx_filename_);
+    if (model_ctx_path.exists() && !model_ctx_filename_.empty()) {
+      return OrtSession::Create(ort_env, model_ctx_path.c_str(), session_options);
+    } else {
+      return OrtSession::Create(ort_env, (config_->config_path / fs::path(model_filename)).c_str(), session_options);
+    }
+  }
 }
 
 std::shared_ptr<Tokenizer> Model::CreateTokenizer() const {

@@ -170,6 +170,7 @@ struct Model : std::enable_shared_from_this<Model>, LeakChecked<Model>, External
                                       bool disable_graph_capture);
 
   std::map<std::string, std::unique_ptr<OrtSessionOptions>> pipeline_session_options_;
+  std::string model_ctx_filename_;
 };
 
 }  // namespace Generators
