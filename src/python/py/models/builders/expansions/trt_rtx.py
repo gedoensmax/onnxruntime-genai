@@ -325,3 +325,304 @@ class TRT_RTX:
         self.make_value(cos_cache_name, self.io_dtype, shape=["max_sequence_length", "head_dim / 2"])
         self.make_value(sin_cache_name, self.io_dtype, shape=["max_sequence_length", "head_dim / 2"])
 
+    def make_whisper_attention_init(self):
+        self.graph.opset_imports[""] = max(self.graph.opset_imports[""], 24)
+
+    def make_whisper_encoder_attention(self, layer_id, attention, root_input, **kwargs):
+        # Whisper encoder self-attention using the standard ONNX Attention op.
+        # TensorRT-RTX requires Q, K, and V to have the same rank, so emit 4D
+        # [batch, heads, sequence, head_size] tensors explicitly.
+        basename = f"/model/layers.{layer_id}/attn"
+
+        qkv_matmul_basename = f"{basename}/qkv_proj/MatMul"
+        qkv_matmul_name = self.make_packed_matmul(
+            attention.q_proj,
+            attention.k_proj,
+            attention.v_proj,
+            qkv_matmul_basename,
+            root_input,
+            seq_dim=self.max_source_positions,
+        )
+        qkv_path = f"{qkv_matmul_name}/output_0"
+
+        q_bias = (
+            attention.q_proj.bias
+            if attention.q_proj.bias is not None
+            else attention.q_proj.weight.new_zeros(attention.q_proj.weight.shape[0])
+        )
+        k_bias = (
+            attention.k_proj.bias
+            if attention.k_proj.bias is not None
+            else attention.k_proj.weight.new_zeros(attention.k_proj.weight.shape[0])
+        )
+        v_bias = (
+            attention.v_proj.bias
+            if attention.v_proj.bias is not None
+            else attention.v_proj.weight.new_zeros(attention.v_proj.weight.shape[0])
+        )
+        qkv_add_name = f"{basename}/qkv_proj/Add"
+        self.make_packed_add(
+            q_bias, k_bias, v_bias, qkv_add_name, root_input=qkv_path, seq_dim=self.max_source_positions
+        )
+        qkv_path = f"{qkv_add_name}/output_0"
+
+        q_path = f"{basename}/qkv_proj/Split/output_0"
+        k_path = f"{basename}/qkv_proj/Split/output_1"
+        v_path = f"{basename}/qkv_proj/Split/output_2"
+        self.make_split(
+            f"{basename}/qkv_proj/Split",
+            inputs=[qkv_path, f"/model/constants/INT64/[{self.q_size}, {self.kv_size}, {self.kv_size}]"],
+            outputs=[q_path, k_path, v_path],
+            dtypes=[self.io_dtype] * 3,
+            shapes=[
+                ["batch_size", self.max_source_positions, self.q_size],
+                ["batch_size", self.max_source_positions, self.kv_size],
+                ["batch_size", self.max_source_positions, self.kv_size],
+            ],
+            axis=-1,
+        )
+
+        q_heads = self.make_whisper_attention_heads(
+            f"{basename}/q_proj", q_path, self.num_attn_heads, self.max_source_positions
+        )
+        k_heads = self.make_whisper_attention_heads(
+            f"{basename}/k_proj", k_path, self.num_kv_heads, self.max_source_positions
+        )
+        v_heads = self.make_whisper_attention_heads(
+            f"{basename}/v_proj", v_path, self.num_kv_heads, self.max_source_positions
+        )
+
+        attn_name = f"{basename}/Attention"
+        attn_output = f"{attn_name}/output_0"
+        self.make_node(
+            "Attention",
+            inputs=[q_heads, k_heads, v_heads],
+            outputs=[attn_output],
+            name=attn_name,
+            is_causal=0,
+            scale=self.attention_attrs["scale"],
+        )
+        self.make_value(
+            attn_output,
+            self.io_dtype,
+            shape=["batch_size", self.num_attn_heads, self.max_source_positions, self.head_size],
+        )
+
+        attn_merged = self.make_whisper_attention_output(
+            basename, attn_output, self.max_source_positions, self.max_source_positions
+        )
+
+        o_matmul_basename = f"{basename}/o_proj/MatMul"
+        o_matmul_name = self.make_matmul(
+            attention.out_proj,
+            o_matmul_basename,
+            attn_merged,
+            seq_dim=self.max_source_positions,
+        )
+
+        o_add_name = f"{basename}/o_proj/Add"
+        self.make_add_bias(
+            attention.out_proj.bias,
+            o_add_name,
+            root_input=f"{o_matmul_name}/output_0",
+            seq_dim=self.max_source_positions,
+        )
+
+        self.layernorm_attrs["skip_input"] = f"{o_add_name}/output_0"
+
+    def make_whisper_decoder_attention(self, layer_id, attention, root_input, **kwargs):
+        basename = f"/model/layers.{layer_id}/attn"
+        past_k, past_v, present_k, present_v = self.make_key_value_cache_names(layer_id)
+
+        qkv_matmul_basename = f"{basename}/qkv_proj/MatMul"
+        qkv_matmul_name = self.make_packed_matmul(
+            attention.q_proj,
+            attention.k_proj,
+            attention.v_proj,
+            qkv_matmul_basename,
+            root_input,
+        )
+        qkv_path = f"{qkv_matmul_name}/output_0"
+
+        q_bias = (
+            attention.q_proj.bias
+            if attention.q_proj.bias is not None
+            else attention.q_proj.weight.new_zeros(attention.q_proj.weight.shape[0])
+        )
+        k_bias = (
+            attention.k_proj.bias
+            if attention.k_proj.bias is not None
+            else attention.k_proj.weight.new_zeros(attention.k_proj.weight.shape[0])
+        )
+        v_bias = (
+            attention.v_proj.bias
+            if attention.v_proj.bias is not None
+            else attention.v_proj.weight.new_zeros(attention.v_proj.weight.shape[0])
+        )
+        qkv_add_name = f"{basename}/qkv_proj/Add"
+        self.make_packed_add(q_bias, k_bias, v_bias, qkv_add_name, root_input=qkv_path)
+        qkv_path = f"{qkv_add_name}/output_0"
+
+        q_path = f"{basename}/qkv_proj/Split/output_0"
+        k_path = f"{basename}/qkv_proj/Split/output_1"
+        v_path = f"{basename}/qkv_proj/Split/output_2"
+        self.make_split(
+            f"{basename}/qkv_proj/Split",
+            inputs=[qkv_path, f"/model/constants/INT64/[{self.q_size}, {self.kv_size}, {self.kv_size}]"],
+            outputs=[q_path, k_path, v_path],
+            dtypes=[self.io_dtype] * 3,
+            shapes=[
+                ["batch_size", "sequence_length", self.q_size],
+                ["batch_size", "sequence_length", self.kv_size],
+                ["batch_size", "sequence_length", self.kv_size],
+            ],
+            axis=-1,
+        )
+
+        q_heads = self.make_whisper_attention_heads(f"{basename}/q_proj", q_path, self.num_attn_heads)
+        k_heads = self.make_whisper_attention_heads(f"{basename}/k_proj", k_path, self.num_kv_heads)
+        v_heads = self.make_whisper_attention_heads(f"{basename}/v_proj", v_path, self.num_kv_heads)
+
+        self.make_concat(
+            f"{basename}/k_cache/Concat",
+            [past_k, k_heads],
+            dtype=self.io_dtype,
+            shape=["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],
+            axis=2,
+        )
+        self.make_node(
+            "Identity",
+            inputs=[f"{basename}/k_cache/Concat/output_0"],
+            outputs=[present_k],
+            name=f"{basename}/k_cache/Identity",
+        )
+        self.make_value(
+            present_k, self.io_dtype, shape=["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size]
+        )
+
+        self.make_concat(
+            f"{basename}/v_cache/Concat",
+            [past_v, v_heads],
+            dtype=self.io_dtype,
+            shape=["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],
+            axis=2,
+        )
+        self.make_node(
+            "Identity",
+            inputs=[f"{basename}/v_cache/Concat/output_0"],
+            outputs=[present_v],
+            name=f"{basename}/v_cache/Identity",
+        )
+        self.make_value(
+            present_v, self.io_dtype, shape=["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size]
+        )
+
+        attn_name = f"{basename}/Attention"
+        attn_output = f"{attn_name}/output_0"
+        self.make_node(
+            "Attention",
+            inputs=[q_heads, present_k, present_v],
+            outputs=[attn_output],
+            name=attn_name,
+            is_causal=0,
+            scale=self.attention_attrs["scale"],
+        )
+        self.make_value(
+            attn_output,
+            self.io_dtype,
+            shape=["batch_size", self.num_attn_heads, "sequence_length", self.head_size],
+        )
+
+        attn_merged = self.make_whisper_attention_output(basename, attn_output, "sequence_length", "sequence_length")
+
+        o_matmul_basename = f"{basename}/o_proj/MatMul"
+        o_matmul_name = self.make_matmul(attention.out_proj, o_matmul_basename, attn_merged)
+
+        o_add_name = f"{basename}/o_proj/Add"
+        self.make_add_bias(attention.out_proj.bias, o_add_name, root_input=f"{o_matmul_name}/output_0")
+
+        self.layernorm_attrs["skip_input"] = f"{o_add_name}/output_0"
+
+    def make_whisper_decoder_cross_attention(self, layer_id, attention, root_input, **kwargs):
+        basename = f"/model/layers.{layer_id}/cross_attn"
+
+        q_matmul_basename = f"{basename}/q_proj/MatMul"
+        q_matmul_name = self.make_matmul(attention.q_proj, q_matmul_basename, root_input)
+        q_path = f"{q_matmul_name}/output_0"
+
+        q_add_name = f"{basename}/q_proj/Add"
+        self.make_add_bias(attention.q_proj.bias, q_add_name, root_input=q_path)
+        q_path = f"{q_add_name}/output_0"
+
+        q_heads = self.make_whisper_attention_heads(f"{basename}/q_proj", q_path, self.num_attn_heads)
+
+        attn_name = f"{basename}/Attention"
+        attn_output = f"{attn_name}/output_0"
+        self.make_node(
+            "Attention",
+            inputs=[
+                q_heads,
+                self.input_names["past_key_cross"][layer_id],
+                self.input_names["past_value_cross"][layer_id],
+            ],
+            outputs=[attn_output],
+            name=attn_name,
+            is_causal=0,
+            scale=self.attention_attrs["scale"],
+        )
+        self.make_value(
+            attn_output,
+            self.io_dtype,
+            shape=["batch_size", self.num_attn_heads, "sequence_length", self.head_size],
+        )
+
+        attn_merged = self.make_whisper_attention_output(basename, attn_output, "sequence_length", "sequence_length")
+
+        o_matmul_basename = f"{basename}/o_proj/MatMul"
+        o_matmul_name = self.make_matmul(attention.out_proj, o_matmul_basename, attn_merged)
+
+        o_add_name = f"{basename}/o_proj/Add"
+        self.make_add_bias(attention.out_proj.bias, o_add_name, root_input=f"{o_matmul_name}/output_0")
+
+        self.layernorm_attrs["skip_input"] = f"{o_add_name}/output_0"
+
+    def make_whisper_attention_heads(self, basename, tensor, heads, sequence_length="sequence_length"):
+        reshape_name = f"{basename}/Reshape"
+        self.make_reshape(
+            reshape_name,
+            [tensor, f"/model/constants/INT64/[0, 0, {heads}, {self.head_size}]"],
+            dtype=self.io_dtype,
+            shape=["batch_size", sequence_length, heads, self.head_size],
+        )
+        transpose_name = f"{basename}/Transpose"
+        self.make_transpose(
+            transpose_name,
+            f"{reshape_name}/output_0",
+            dtype=self.io_dtype,
+            shape=["batch_size", heads, sequence_length, self.head_size],
+            perm=[0, 2, 1, 3],
+        )
+        return f"{transpose_name}/output_0"
+
+    def make_whisper_attention_output(self, basename, attn_output, input_sequence_length, output_sequence_length):
+        attn_transpose_name = f"{basename}/Attention/Transpose"
+        self.make_transpose(
+            attn_transpose_name,
+            attn_output,
+            dtype=self.io_dtype,
+            shape=["batch_size", input_sequence_length, self.num_attn_heads, self.head_size],
+            perm=[0, 2, 1, 3],
+        )
+
+        attn_reshape_name = f"{basename}/Attention/Reshape"
+        self.make_reshape(
+            attn_reshape_name,
+            [
+                f"{attn_transpose_name}/output_0",
+                f"/model/constants/INT64/[0, 0, {self.head_size * self.num_attn_heads}]",
+            ],
+            dtype=self.io_dtype,
+            shape=["batch_size", output_sequence_length, self.head_size * self.num_attn_heads],
+        )
+        return f"{attn_reshape_name}/output_0"
+

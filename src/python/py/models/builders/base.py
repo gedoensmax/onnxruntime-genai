@@ -362,6 +362,17 @@ class Model:
             self.make_simplified_layer_norm = TRT_RTX.make_simplified_layer_norm.__get__(self, self.__class__)
             self.make_padded_cache = TRT_RTX.make_padded_cache.__get__(self, self.__class__)
             self.make_split_if_nodes = TRT_RTX.make_split_if_nodes.__get__(self, self.__class__)
+            if self.__class__.__name__ == "WhisperEncoder":
+                TRT_RTX.make_whisper_attention_init(self)
+                self.make_whisper_attention_heads = TRT_RTX.make_whisper_attention_heads.__get__(self, self.__class__)
+                self.make_whisper_attention_output = TRT_RTX.make_whisper_attention_output.__get__(self, self.__class__)
+                self.make_attention = TRT_RTX.make_whisper_encoder_attention.__get__(self, self.__class__)
+            elif self.__class__.__name__ == "WhisperDecoder":
+                TRT_RTX.make_whisper_attention_init(self)
+                self.make_whisper_attention_heads = TRT_RTX.make_whisper_attention_heads.__get__(self, self.__class__)
+                self.make_whisper_attention_output = TRT_RTX.make_whisper_attention_output.__get__(self, self.__class__)
+                self.make_attention = TRT_RTX.make_whisper_decoder_attention.__get__(self, self.__class__)
+                self.make_cross_attention = TRT_RTX.make_whisper_decoder_cross_attention.__get__(self, self.__class__)
 
         elif self.ep == "webgpu":
             from .expansions import WebGPU
